@@ -134,7 +134,11 @@ export default function SkillPanel({
                   </span>
                 </button>
                 <button
-                  onClick={() => onAnalyzeOne(skill.path)}
+                  onClick={() => {
+                    // Auto-expand so the user immediately sees the live thinking stream
+                    setExpanded((prev) => ({ ...prev, [skill.path]: true }));
+                    onAnalyzeOne(skill.path);
+                  }}
                   disabled={running || status === "analyzing"}
                   className="shrink-0 rounded-md border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 transition-colors hover:border-zinc-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
                 >
