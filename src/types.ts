@@ -32,19 +32,13 @@ export type SkillsResponse = {
   truncated: boolean;
 };
 
-export type AnalyzeResponse = {
-  path: string;
-  branch: string;
-  /** Review suggestions produced by GLM (Markdown) */
-  suggestions: string;
-  /** Number of rounds actually executed (ANALYSIS_ROUNDS; >1 means multi-round deep dive) */
-  rounds: number;
-};
-
 export type SkillStatus = "pending" | "analyzing" | "done" | "error";
 
 export type SkillResult = {
   status: SkillStatus;
+  /** Model reasoning trace, streamed live during analysis */
+  thinking?: string;
+  /** Review report — filled progressively while streaming, complete when done */
   suggestions?: string;
   rounds?: number;
   error?: string;

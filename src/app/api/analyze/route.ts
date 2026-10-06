@@ -8,7 +8,6 @@ import {
 } from "@/lib/github";
 import { runAnalysis } from "@/lib/glm";
 import { getSessionToken } from "@/lib/session";
-import type { AnalyzeResponse } from "@/types";
 
 type AnalyzeBody = {
   repo?: string;
@@ -16,8 +15,17 @@ type AnalyzeBody = {
 };
 
 /**
- * Analyzes a single SKILL.md: fetch the file → call GLM for review suggestions.
+ * Analyzes a single SKILL.md and streams the review live.
  * POST { repo: "owner/name", path: ".claude/skills/<name>/SKILL.md" }
+ *
+ * The response body is NDJSON (one JSON object per line):
+ *   {"type":"meta","branch":"main"}
+ *   {"type":"thinking","content":"..."}   — model reasoning, streamed
+ *   {"type":"text","content":"..."}       — review report, streamed
+ *   {"type":"round_start","round":2}      — only when ANALYSIS_ROUNDS > 1
+ *   {"type":"done","rounds":1,"suggestions":"..."}
+ *   {"type":"error","error":"..."}        — terminal on failure
+ *
  * One skill per request; the frontend dispatches them one by one, which yields
  * natural progress and avoids concurrent LLM rate limits.
  */
@@ -55,21 +63,41 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  try {
-    const branch = await getDefaultBranch(token, parsed.owner, parsed.name);
-    const content = await fetchFileContent(token, parsed.owner, parsed.name, path, branch);
-    const { suggestions, rounds } = await runAnalysis(path, content);
-    return NextResponse.json({
-      path,
-      branch,
-      suggestions,
-      rounds,
-    } satisfies AnalyzeResponse);
-  } catch (e) {
-    const status = e instanceof GhError ? (e.status === 404 ? 404 : 502) : 502;
-    return NextResponse.json(
-      { error: e instanceof Error ? e.message : "Analysis failed" },
-      { status },
-    );
-  }
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const encoder = new TextEncoder();
+      const send = (event: Record<string, unknown>) =>
+        controller.enqueue(encoder.encode(JSON.stringify(event) + "\n"));
+      try {
+        const branch = await getDefaultBranch(token, parsed.owner, parsed.name);
+        send({ type: "meta", branch });
+        const content = await fetchFileContent(token, parsed.owner, parsed.name, path, branch);
+        const { suggestions, rounds } = await runAnalysis(
+          path,
+          content,
+          (kind, chunk) => send({ type: kind, content: chunk }),
+          (round) => send({ type: "round_start", round }),
+        );
+        send({ type: "done", rounds, suggestions });
+      } catch (e) {
+        const status = e instanceof GhError ? e.status : undefined;
+        send({
+          type: "error",
+          error: e instanceof Error ? e.message : "Analysis failed",
+          ...(status ? { status } : {}),
+        });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-store, no-transform",
+      // Disable proxy buffering so chunks reach the browser as they are produced
+      "X-Accel-Buffering": "no",
+    },
+  });
 }

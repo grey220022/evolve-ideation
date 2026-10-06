@@ -7,8 +7,11 @@ type Turn = {
 
 const TIMEOUT_MS = 180_000;
 const TEMPERATURE = 0.3;
-/** Required by the Anthropic protocol; glm-4.6+ produces thinking before the answer, so leave ample budget */
+/** Required by the Anthropic protocol; thinking models produce reasoning before the answer, so leave ample budget */
 const MAX_TOKENS = 16384;
+
+export type DeltaKind = "thinking" | "text";
+export type DeltaHandler = (kind: DeltaKind, content: string) => void;
 
 export function glmConfig() {
   const apiKey = process.env.GLM_API_KEY;
@@ -27,35 +30,48 @@ export function glmConfig() {
   return { apiKey, baseUrl, model, protocol };
 }
 
-type AnthropicResponse = {
-  content?: Array<{
-    type: string;
-    text?: string;
-  }>;
-};
-
-type GlmChatResponse = {
-  choices?: Array<{
-    message?: {
-      content?: string;
-    };
-  }>;
-};
-
-function assertContent(text: string): string {
-  if (!text.trim()) {
-    throw new Error("GLM returned empty content");
+/** Parses "data: {...}" SSE frames from a response body and yields each JSON payload */
+async function* sseEvents(res: Response): AsyncGenerator<Record<string, unknown>> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).replace(/\r$/, "");
+      buf = buf.slice(nl + 1);
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        yield JSON.parse(payload) as Record<string, unknown>;
+      } catch {
+        // skip malformed frames
+      }
+    }
   }
-  return text;
 }
 
-/** Anthropic-compatible endpoint (/v1/messages): system is a top-level field, response is an array of content blocks */
+async function assertOk(res: Response): Promise<void> {
+  if (res.ok) return;
+  const text = await res.text().catch(() => "");
+  throw new Error(`GLM API error (${res.status}): ${text.slice(0, 300) || res.statusText}`);
+}
+
+/**
+ * Anthropic-compatible endpoint (/v1/messages), streamed.
+ * thinking_delta chunks are surfaced as "thinking"; text_delta as "text".
+ */
 async function chatAnthropic(
   apiKey: string,
   baseUrl: string,
   model: string,
   system: string,
   turns: Turn[],
+  onDelta?: DeltaHandler,
 ): Promise<string> {
   const res = await fetch(`${baseUrl}/v1/messages`, {
     method: "POST",
@@ -70,29 +86,43 @@ async function chatAnthropic(
       temperature: TEMPERATURE,
       system,
       messages: turns,
+      stream: true,
     }),
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`GLM API error (${res.status}): ${text.slice(0, 300) || res.statusText}`);
+  await assertOk(res);
+
+  let text = "";
+  for await (const ev of sseEvents(res)) {
+    if (ev.type === "error") {
+      throw new Error(`GLM stream error: ${JSON.stringify(ev.error ?? ev).slice(0, 200)}`);
+    }
+    if (ev.type !== "content_block_delta") continue;
+    const delta = ev.delta as
+      | { type?: string; text?: string; thinking?: string }
+      | undefined;
+    if (!delta) continue;
+    if (delta.type === "text_delta" && delta.text) {
+      text += delta.text;
+      onDelta?.("text", delta.text);
+    } else if (delta.type === "thinking_delta" && delta.thinking) {
+      onDelta?.("thinking", delta.thinking);
+    }
   }
-  const data = (await res.json()) as AnthropicResponse;
-  // Concatenate text blocks; drop thinking blocks (reasoning does not belong in the report)
-  const text = (data.content ?? [])
-    .filter((block) => block.type === "text" && block.text)
-    .map((block) => block.text)
-    .join("");
-  return assertContent(text);
+  return text;
 }
 
-/** OpenAI-compatible endpoint (/chat/completions): system is the first message */
+/**
+ * OpenAI-compatible endpoint (/chat/completions), streamed.
+ * delta.content is the answer; delta.reasoning_content is the thinking trace.
+ */
 async function chatOpenAI(
   apiKey: string,
   baseUrl: string,
   model: string,
   system: string,
   turns: Turn[],
+  onDelta?: DeltaHandler,
 ): Promise<string> {
   const res = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
@@ -103,17 +133,26 @@ async function chatOpenAI(
     body: JSON.stringify({
       model,
       temperature: TEMPERATURE,
-      stream: false,
+      stream: true,
       messages: [{ role: "system", content: system }, ...turns],
     }),
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`GLM API error (${res.status}): ${text.slice(0, 300) || res.statusText}`);
+  await assertOk(res);
+
+  let text = "";
+  for await (const ev of sseEvents(res)) {
+    const delta = (
+      ev.choices as Array<{ delta?: { content?: string; reasoning_content?: string } }> | undefined
+    )?.[0]?.delta;
+    if (!delta) continue;
+    if (delta.reasoning_content) onDelta?.("thinking", delta.reasoning_content);
+    if (delta.content) {
+      text += delta.content;
+      onDelta?.("text", delta.content);
+    }
   }
-  const data = (await res.json()) as GlmChatResponse;
-  return assertContent(data.choices?.[0]?.message?.content ?? "");
+  return text;
 }
 
 export type AnalysisResult = {
@@ -122,7 +161,8 @@ export type AnalysisResult = {
 };
 
 /**
- * Runs the review for a single SKILL.md.
+ * Runs the streamed review for a single SKILL.md. Deltas (thinking + answer
+ * text) are forwarded to onDelta as they arrive, so callers can render them live.
  * ANALYSIS_ROUNDS=1 by default (single-pass quick review); raise it to enable
  * multi-round mode: each round carries the full conversation history and
  * critically deepens the previous one; the last round's output wins.
@@ -130,6 +170,8 @@ export type AnalysisResult = {
 export async function runAnalysis(
   skillPath: string,
   skillContent: string,
+  onDelta?: DeltaHandler,
+  onRoundStart?: (round: number) => void,
 ): Promise<AnalysisResult> {
   const { apiKey, baseUrl, model, protocol } = glmConfig();
   const rounds = Math.max(1, Number(process.env.ANALYSIS_ROUNDS) || 1);
@@ -138,16 +180,20 @@ export async function runAnalysis(
 
   let suggestions = "";
   for (let round = 1; round <= rounds; round++) {
+    onRoundStart?.(round);
     turns.push({
       role: "user",
       content: round === 1 ? firstRoundPrompt(skillPath, skillContent) : deepeningPrompt(round),
     });
     suggestions =
       protocol === "anthropic"
-        ? await chatAnthropic(apiKey, baseUrl, model, system, turns)
-        : await chatOpenAI(apiKey, baseUrl, model, system, turns);
+        ? await chatAnthropic(apiKey, baseUrl, model, system, turns, onDelta)
+        : await chatOpenAI(apiKey, baseUrl, model, system, turns, onDelta);
     turns.push({ role: "assistant", content: suggestions });
   }
 
+  if (!suggestions.trim()) {
+    throw new Error("GLM returned empty content");
+  }
   return { suggestions, rounds };
 }

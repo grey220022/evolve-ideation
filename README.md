@@ -65,13 +65,12 @@ Open <http://localhost:3000>.
 | `GLM_MODEL` | `glm-4.6` | Any model your key supports (list via `GET {GLM_BASE_URL}/v1/models`) |
 | `ANALYSIS_ROUNDS` | `1` | **1 = single-pass quick review**; raise it (2, 3, …) for multi-round mode: each round carries the full conversation history and critically deepens the previous one; the last round's output wins |
 
-## Timing expectations
+## Timing expectations & streaming
 
-Each skill analysis makes 2 GitHub API calls (< 1s combined) plus 1 GLM call, which dominates: thinking models like `glm-5.3` generate at roughly 60–70 tokens/s, so a full review typically takes 30–90 seconds per skill. The UI shows per-skill elapsed time. "Analyze all" runs skills sequentially to avoid rate limits and to show natural progress.
+Each skill analysis makes 2 GitHub API calls (< 1s combined) plus 1 GLM call, which dominates: thinking models like `glm-5.3` generate at roughly 60–70 tokens/s, so a full review typically takes 30–90 seconds per skill. The review is streamed live (NDJSON): the model's reasoning trace appears first, then the report renders progressively as it is written. Total duration is unchanged by streaming — it is a perceived-latency improvement. The UI shows per-skill elapsed time, and "Analyze all" runs skills sequentially to avoid rate limits and to show natural progress.
 
 ## MVP boundaries (not implemented)
 
 - Suggestions are display-only; nothing is written back to GitHub (branch/PR creation could come next)
 - No user accounts or persistence — refreshing clears analysis results
-- Non-streaming output (a single synchronous response per skill)
 - SKILL.md files larger than 1MB are unsupported (contents API limit)

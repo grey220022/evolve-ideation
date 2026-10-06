@@ -5,7 +5,6 @@ import ConnectButton from "@/components/ConnectButton";
 import RepoPicker from "@/components/RepoPicker";
 import SkillPanel from "@/components/SkillPanel";
 import type {
-  AnalyzeResponse,
   MeResponse,
   Repo,
   SkillsResponse,
@@ -80,21 +79,82 @@ export default function Home() {
   async function analyzeOne(path: string) {
     if (!repo || resultsRef.current[path]?.status === "analyzing") return;
     const started = Date.now();
-    setResults((prev) => ({ ...prev, [path]: { status: "analyzing" } }));
+    setResults((prev) => ({ ...prev, [path]: { status: "analyzing", thinking: "", suggestions: "" } }));
+
+    // Stream accumulators; state is flushed at a throttled rate to keep rendering cheap
+    let thinking = "";
+    let text = "";
+    let rounds: number | undefined;
     try {
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repo, path }),
       });
-      const data = (await res.json()) as AnalyzeResponse & { error?: string };
-      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      if (!res.ok || !res.body) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(data.error ?? `HTTP ${res.status}`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let lastFlush = 0;
+      const flush = () => {
+        const now = Date.now();
+        if (now - lastFlush < 80) return; // throttle to ~12 renders/s
+        lastFlush = now;
+        setResults((prev) => ({
+          ...prev,
+          [path]: { status: "analyzing", thinking, suggestions: text, rounds },
+        }));
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          let ev: {
+            type?: string;
+            content?: string;
+            round?: number;
+            rounds?: number;
+            suggestions?: string;
+            error?: string;
+          };
+          try {
+            ev = JSON.parse(line);
+          } catch {
+            continue; // skip malformed lines
+          }
+          if (ev.type === "thinking" && ev.content) {
+            thinking += ev.content;
+          } else if (ev.type === "text" && ev.content) {
+            text += ev.content;
+          } else if (ev.type === "round_start") {
+            thinking += `\n\n— Round ${ev.round} —\n\n`;
+            text = ""; // the last round's output wins
+          } else if (ev.type === "done") {
+            rounds = ev.rounds;
+            if (ev.suggestions) text = ev.suggestions;
+          } else if (ev.type === "error") {
+            throw new Error(ev.error ?? "Analysis failed");
+          }
+          flush();
+        }
+      }
       setResults((prev) => ({
         ...prev,
         [path]: {
           status: "done",
-          suggestions: data.suggestions,
-          rounds: data.rounds,
+          thinking,
+          suggestions: text,
+          rounds,
           elapsedMs: Date.now() - started,
         },
       }));

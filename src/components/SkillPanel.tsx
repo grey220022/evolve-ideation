@@ -1,8 +1,31 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import MarkdownView from "@/components/MarkdownView";
 import type { SkillFile, SkillResult, SkillStatus } from "@/types";
+
+/** Live-streamed model reasoning: dim box, auto-scrolled to the bottom as it grows */
+function ThinkingStream({ content }: { content: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [content]);
+  return (
+    <div>
+      <div className="mb-1 flex items-center gap-1.5 text-xs font-medium text-zinc-500">
+        <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-zinc-500" />
+        Thinking…
+      </div>
+      <div
+        ref={ref}
+        className="max-h-56 overflow-y-auto whitespace-pre-wrap rounded-lg border-l-2 border-zinc-700 bg-zinc-900/60 px-3 py-2 text-xs leading-5 text-zinc-500"
+      >
+        {content}
+      </div>
+    </div>
+  );
+}
 
 const STATUS_META: Record<SkillStatus, { label: string; className: string }> = {
   pending: { label: "Pending", className: "bg-zinc-800 text-zinc-400" },
@@ -125,10 +148,37 @@ export default function SkillPanel({
                     <p className="text-sm text-red-400">{result?.error ?? "Unknown error"}</p>
                   )}
                   {status === "done" && result?.suggestions && (
-                    <MarkdownView content={result.suggestions} />
+                    <>
+                      <MarkdownView content={result.suggestions} />
+                      {result.thinking && (
+                        <details className="mt-4">
+                          <summary className="cursor-pointer text-xs text-zinc-500 hover:text-zinc-300">
+                            Model reasoning
+                          </summary>
+                          <div className="mt-2 max-h-72 overflow-y-auto whitespace-pre-wrap rounded-lg border-l-2 border-zinc-700 bg-zinc-900/60 px-3 py-2 text-xs leading-5 text-zinc-500">
+                            {result.thinking}
+                          </div>
+                        </details>
+                      )}
+                    </>
                   )}
                   {status === "analyzing" && (
-                    <p className="text-sm text-zinc-500">GLM is reviewing this skill…</p>
+                    <div className="space-y-4">
+                      {result?.thinking ? (
+                        <ThinkingStream content={result.thinking} />
+                      ) : (
+                        <p className="text-sm text-zinc-500">Connecting to GLM…</p>
+                      )}
+                      {result?.suggestions && (
+                        <div>
+                          <div className="mb-2 flex items-center gap-1.5 text-xs font-medium text-emerald-400">
+                            <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
+                            Writing review…
+                          </div>
+                          <MarkdownView content={result.suggestions + " ▍"} />
+                        </div>
+                      )}
+                    </div>
                   )}
                   {status === "pending" && (
                     <p className="text-sm text-zinc-500">Not analyzed yet. Click "Analyze" to start.</p>
